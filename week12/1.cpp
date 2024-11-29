@@ -1,152 +1,138 @@
 #include <mpi.h>
-#include <iostream>
-#include <fstream>
 #include <vector>
 #include <cmath>
+#include <iostream>
+#include <fstream>
 using namespace std;
 
-const double XLength = 2.0, YLength = 1.0;  
-const int XPoints = 60, YPoints = 30;      
-const double deltaX = XLength / (XPoints - 1), deltaY = YLength / (YPoints - 1);
-const double epsilon = 1e-6;              
-const int maxIterations = 10000;           
-
-double getBoundaryValue(int x, int y) {
-    if (y == 0) return 0.0;                         // u(x, 0)
-    if (y == YPoints - 1) return 0.5 * x * x + 0.5 * x; // u(x, YLength)
-    if (x == 0) return 0.0;                         // u(0, y)
-    if (x == XPoints - 1) return 2.0 * y * y + y;   // u(XLength, y)
-    return 0.0;
+void bound_cond(vector<vector<double>>& u, int block_rows, int block_cols,
+                             int i1, int j1, double dx, double dy, int N, int M) {
+    for (int i = 1; i <= block_rows; ++i) {
+        for (int j = 1; j <= block_cols; ++j) {
+            double x = (i1 + i - 1) * dx;
+            double y = (j1 + j - 1) * dy;
+            if (i1 + i - 1 == 0) u[i][j] = 0.0;
+            if (i1 + i - 1 == N - 1) u[i][j] = 0.5 * x * x + 0.5 * x;
+            if (j1 + j - 1 == 0) u[i][j] = 0.0;
+            if (j1 + j - 1 == M - 1) u[i][j] = 2.0 * y * y + y;
+        }
+    }
 }
 
-int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+int main() {
+    MPI_Init(NULL, NULL);
 
-    int rank, numProcs;
+    int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &numProcs);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int gridDims[2] = {0, 0};
-    MPI_Dims_create(numProcs, 2, gridDims);
-    int periodic[2] = {0, 0};
-    MPI_Comm gridComm;
-    MPI_Cart_create(MPI_COMM_WORLD, 2, gridDims, periodic, 0, &gridComm);
+    int N = 128, M = 128;
+    double dx = 1.0 / (N - 1), dy = 1.0 / (M - 1);
+    double epsilon = 1e-6;
 
-    int coords[2], upNeighbor, downNeighbor, leftNeighbor, rightNeighbor;
-    MPI_Cart_coords(gridComm, rank, 2, coords);
-    MPI_Cart_shift(gridComm, 0, 1, &upNeighbor, &downNeighbor);
-    MPI_Cart_shift(gridComm, 1, 1, &leftNeighbor, &rightNeighbor);
+    int dims[2] = {0, 0};
+    MPI_Dims_create(size, 2, dims);
 
-    int localX = XPoints / gridDims[0];
-    int localY = YPoints / gridDims[1];
-    int offsetX = coords[0] * localX;
-    int offsetY = coords[1] * localY;
+    int periods[2] = {0, 0};
+    MPI_Comm cart_comm;
+    MPI_Cart_create(MPI_COMM_WORLD, 2, dims, periods, 0, &cart_comm);
 
-    vector<vector<double>> prevGrid(localX + 2, vector<double>(localY + 2, 0.0));
-    vector<vector<double>> currGrid(localX + 2, vector<double>(localY + 2, 0.0));
-    vector<vector<double>> sequentialResult(XPoints, vector<double>(YPoints, 0.0));
+    int coords[2];
+    MPI_Cart_coords(cart_comm, rank, 2, coords);
 
-    for (int i = 0; i < XPoints; ++i) {
-        for (int j = 0; j < YPoints; ++j) {
-            if (i == 0 || i == XPoints - 1 || j == 0 || j == YPoints - 1) {
-                sequentialResult[i][j] = getBoundaryValue(i, j);
+    int top, bottom, left, right;
+    MPI_Cart_shift(cart_comm, 0, 1, &top, &bottom);
+    MPI_Cart_shift(cart_comm, 1, 1, &left, &right);
+
+    int i1 = (N * coords[0]) / dims[0];
+    int i2 = (N * (coords[0] + 1)) / dims[0];
+    int j1 = (M * coords[1]) / dims[1];
+    int j2 = (M * (coords[1] + 1)) / dims[1];
+
+    int block_rows = i2 - i1;
+    int block_cols = j2 - j1;
+
+    vector<vector<double>> u(block_rows + 2, vector<double>(block_cols + 2, 0.0));
+
+    bound_cond(u, block_rows, block_cols, i1, j1, dx, dy, N, M);
+
+    double max_diff;
+    do {
+        max_diff = 0.0;
+
+        if (bottom != MPI_PROC_NULL) {
+            MPI_Send(u[block_rows].data(), block_cols + 2, MPI_DOUBLE, bottom, 0, cart_comm);
+            MPI_Recv(u[block_rows + 1].data(), block_cols + 2, MPI_DOUBLE, bottom, 0, cart_comm, MPI_STATUS_IGNORE);
+        }
+        if (top != MPI_PROC_NULL) {
+            MPI_Recv(u[0].data(), block_cols + 2, MPI_DOUBLE, top, 0, cart_comm, MPI_STATUS_IGNORE);
+            MPI_Send(u[1].data(), block_cols + 2, MPI_DOUBLE, top, 0, cart_comm);
+        }
+
+        vector<double> left_col(block_rows + 2), right_col(block_rows + 2);
+        vector<double> left_ghost(block_rows + 2), right_ghost(block_rows + 2);
+        for (int i = 0; i < block_rows + 2; ++i) {
+            left_col[i] = u[i][1];
+            right_col[i] = u[i][block_cols];
+        }
+
+        if (right != MPI_PROC_NULL) {
+            MPI_Send(right_col.data(), block_rows + 2, MPI_DOUBLE, right, 0, cart_comm);
+            MPI_Recv(right_ghost.data(), block_rows + 2, MPI_DOUBLE, right, 0, cart_comm, MPI_STATUS_IGNORE);
+            for (int i = 0; i < block_rows + 2; ++i) {
+                u[i][block_cols + 1] = right_ghost[i];
             }
         }
-    }
+        if (left != MPI_PROC_NULL) {
+            MPI_Recv(left_ghost.data(), block_rows + 2, MPI_DOUBLE, left, 0, cart_comm, MPI_STATUS_IGNORE);
+            MPI_Send(left_col.data(), block_rows + 2, MPI_DOUBLE, left, 0, cart_comm);
+            for (int i = 0; i < block_rows + 2; ++i) {
+                u[i][0] = left_ghost[i];
+            }
+        }
 
-    if (rank == 0) {
-        // seq for 0
-        vector<vector<double>> u_temp = sequentialResult;
-        double local_error;
-        int iteration = 0;
-
-        do {
-            local_error = 0.0;
-            for (int i = 1; i < XPoints - 1; ++i) {
-                for (int j = 1; j < YPoints - 1; ++j) {
-                    sequentialResult[i][j] = 0.25 * (u_temp[i - 1][j] + u_temp[i + 1][j] + u_temp[i][j - 1] + u_temp[i][j + 1]);
-                    local_error = max(local_error, abs(sequentialResult[i][j] - u_temp[i][j]));
+        for (int i = 1; i <= block_rows; ++i) {
+            for (int j = 1; j <= block_cols; ++j) {
+                if ((i1 + i - 1 == 0 || i1 + i - 1 == N - 1) ||
+                    (j1 + j - 1 == 0 || j1 + j - 1 == M - 1)) {
+                    continue;
                 }
-            }
-            u_temp = sequentialResult;
-            ++iteration;
-        } while (local_error > epsilon && iteration < maxIterations);
-
-        ofstream seqFile("seq_result.txt");
-        for (int i = 0; i < XPoints; ++i) {
-            for (int j = 0; j < YPoints; ++j) {
-                seqFile << i * deltaX << " " << j * deltaY << " " << sequentialResult[i][j] << "\n";
+                double old_u = u[i][j];
+                u[i][j] = 0.25 * (u[i - 1][j] + u[i + 1][j] + u[i][j - 1] + u[i][j + 1]);
+                max_diff = max(max_diff, fabs(u[i][j] - old_u));
             }
         }
-        seqFile.close();
-    }
 
-    double globalError = 1.0;
-    int iteration = 0;
+        double global_max_diff;
+        MPI_Allreduce(&max_diff, &global_max_diff, 1, MPI_DOUBLE, MPI_MAX, cart_comm);
+        max_diff = global_max_diff;
 
-    for (int i = 0; i < localX + 2; ++i) {
-        for (int j = 0; j < localY + 2; ++j) {
-            int globalX = offsetX + i - 1;
-            int globalY = offsetY + j - 1;
-            if (globalX == 0 || globalX == XPoints - 1 || globalY == 0 || globalY == YPoints - 1) {
-                prevGrid[i][j] = getBoundaryValue(globalX, globalY);
-                currGrid[i][j] = getBoundaryValue(globalX, globalY);
-            }
+    } while (max_diff > epsilon);
+
+    vector<double> local_data;
+    for (int i = 1; i <= block_rows; ++i) {
+        for (int j = 1; j <= block_cols; ++j) {
+            double x = (i1 + i - 1) * dx;
+            double y = (j1 + j - 1) * dy;
+            local_data.push_back(x);
+            local_data.push_back(y);
+            local_data.push_back(u[i][j]);
         }
     }
 
-    while (globalError > epsilon && iteration < maxIterations) {
-        for (int i = 1; i <= localX; ++i) {
-            for (int j = 1; j <= localY; ++j) {
-                currGrid[i][j] = 0.25 * (prevGrid[i - 1][j] + prevGrid[i + 1][j] + prevGrid[i][j - 1] + prevGrid[i][j + 1]);
-            }
-        }
+    int local_size = local_data.size();
+    int total_size = local_size * size;
+    vector<double> global_data(total_size);
 
-        MPI_Status status;
-
-        MPI_Sendrecv(&currGrid[1][1], localY, MPI_DOUBLE, upNeighbor, 0,
-                     &currGrid[0][1], localY, MPI_DOUBLE, upNeighbor, 0, gridComm, &status);
-        MPI_Sendrecv(&currGrid[localX][1], localY, MPI_DOUBLE, downNeighbor, 1,
-                     &currGrid[localX + 1][1], localY, MPI_DOUBLE, downNeighbor, 1, gridComm, &status);
-
-        vector<double> sendLeft(localX), recvLeft(localX);
-        vector<double> sendRight(localX), recvRight(localX);
-
-        for (int i = 1; i <= localX; ++i) {
-            sendLeft[i - 1] = currGrid[i][1];
-            sendRight[i - 1] = currGrid[i][localY];
-        }
-
-        MPI_Sendrecv(sendLeft.data(), localX, MPI_DOUBLE, leftNeighbor, 2,
-                     recvRight.data(), localX, MPI_DOUBLE, rightNeighbor, 2, gridComm, &status);
-        MPI_Sendrecv(sendRight.data(), localX, MPI_DOUBLE, rightNeighbor, 3,
-                     recvLeft.data(), localX, MPI_DOUBLE, leftNeighbor, 3, gridComm, &status);
-
-        for (int i = 1; i <= localX; ++i) {
-            currGrid[i][0] = recvLeft[i - 1];
-            currGrid[i][localY + 1] = recvRight[i - 1];
-        }
-
-        double localError = 0.0;
-        for (int i = 1; i <= localX; ++i) {
-            for (int j = 1; j <= localY; ++j) {
-                localError = max(localError, fabs(currGrid[i][j] - prevGrid[i][j]));
-            }
-        }
-
-        MPI_Allreduce(&localError, &globalError, 1, MPI_DOUBLE, MPI_MAX, gridComm);
-        prevGrid.swap(currGrid);
-        ++iteration;
-    }
+    MPI_Gather(local_data.data(), local_size, MPI_DOUBLE, global_data.data(), local_size, MPI_DOUBLE, 0, cart_comm);
 
     if (rank == 0) {
-        ofstream parFile("parallel_result.txt");
-        for (int i = 0; i < XPoints; ++i) {
-            for (int j = 0; j < YPoints; ++j) {
-                parFile << i * deltaX << " " << j * deltaY << " " << sequentialResult[i][j] << "\n";
-            }
+        ofstream outfile("result_parallel.txt");
+        for (size_t i = 0; i < global_data.size(); i += 3) {
+            outfile << global_data[i] << " " << global_data[i + 1] << " " << global_data[i + 2] << "\n";
         }
-        parFile.close();
+        outfile.close();
+        cout << "results saved in result_parallel.txt" << endl;
     }
 
     MPI_Finalize();
